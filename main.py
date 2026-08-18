@@ -248,13 +248,20 @@ def gerar_parecer(body: dict, x_api_key: str = Header(default="")):
 
     payload = normalize_payload(body)
 
-    # nome do arquivo
+    # nome do arquivo — usa a data de REALIZAÇÃO da entrevista
+    # (Data_Entrevista), não a data de envio, pra bater com o padrão já
+    # usado hoje (ex.: "Parecer - ANS - Analista de Testes - Fulano -
+    # 2026-05-07.docx"). Cai pra Data_Envio ou hoje se não vier.
     hoje = datetime.date.today()
-    data_envio = parse_date_flexible(payload.get("Data_Envio")) or hoje
+    data_realizacao = (
+        parse_date_flexible(payload.get("Data_Entrevista"))
+        or parse_date_flexible(payload.get("Data_Envio"))
+        or hoje
+    )
     cliente = sanitize_filename(payload.get("Cliente"))
     cargo = sanitize_filename(payload.get("Cargo"))
     cand = sanitize_filename(payload.get("Nome_Candidato"))
-    dt_str = data_envio.strftime("%Y-%m-%d")
+    dt_str = data_realizacao.strftime("%Y-%m-%d")
     filename = f"Parecer - {cliente} - {cargo} - {cand} - {dt_str}.docx"
 
     # 1) Gera o docx
