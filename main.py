@@ -1,23 +1,31 @@
 """
-main.py — Serviço "gerar_parecer" (chamado por uma ação HTTP dentro do
-flow do Power Automate, no lugar da ação nativa "Popular um modelo do
-Word" — que não funciona porque os Content Controls do template estão
-dentro de uma tabela).
+main.py — Serviço "gerar_parecer"
 -----------------------------------------------------------------
-Recebe do FLOW (não mais direto do Copilot Studio) o JSON com os 138
-campos que o agente já montou, no MESMO formato de `dados_parecer_json`
-descrito nas instruções do agente (ver instrucoes_agente_v3_flow.md).
+Este serviço NÃO fala mais direto com o SharePoint / Microsoft Graph (a
+versão antiga fazia isso e exigia um App Registration no Entra ID com
+consentimento de administrador). Agora ele só recebe dados e devolve
+arquivos prontos — quem grava no SharePoint é o próprio Power Automate,
+usando os conectores nativos de SharePoint (login normal, sem admin).
 
-O que este serviço faz, na ordem:
-  1. Recebe o JSON de 138 campos direto no corpo da requisição (POST).
-  2. Preenche o ModeloParecer_jinja.docx via docxtpl (headless, sem
-     precisar do Word — e sem se importar se os campos estão dentro de
-     tabela ou não, ao contrário da ação nativa do Word Online).
-  3. Sobe o .docx pro SharePoint via Microsoft Graph API.
-  4. Baixa o base_talentos.xlsx atual do SharePoint, faz upsert (mesma
-     regra de dedupe do registrar_talentos.py original) e reenvia.
-  5. Devolve JSON pro flow: link do documento + status da base. O flow
-     só repassa isso pro "Respond to the agent".
+Fluxo, na ordem:
+  1. O flow do Power Automate baixa o Base de Talentos atual do
+     SharePoint (ação nativa "Obter conteúdo do arquivo") e converte pra
+     base64.
+  2. O flow chama este serviço via HTTP POST, mandando no corpo:
+       - todos os 138 campos do parecer (o mesmo dados_parecer_json já
+         parseado pelo Parse JSON do flow);
+       - "excel_atual_base64": o conteúdo do Excel atual, em base64
+         (pode vir vazio/omitido se o arquivo ainda não existir no
+         SharePoint — nesse caso um Excel novo é criado do zero).
+  3. Este serviço gera o Word (docxtpl) e faz o upsert no Excel (mesma
+     regra de dedupe do registrar_talentos.py original: chave composta
+     Nome_Completo+Cliente+Cargo_Aplicado+Recrutador_Responsavel,
+     mantendo a linha com a Data_Entrevista mais recente).
+  4. Devolve ao flow, em base64: o Word novo e o Excel atualizado, mais o
+     nome do arquivo do parecer e o status da Base de Talentos
+     ("appended" / "updated" / "skipped" / "sem_dados_minimos").
+  5. O flow grava os dois arquivos no SharePoint com as ações nativas
+     "Criar arquivo" / "Atualizar arquivo" e responde ao agente.
 
 Rodar localmente pra testar:
     uvicorn main:app --host 0.0.0.0 --port 8000
@@ -25,48 +33,34 @@ Rodar localmente pra testar:
 Variáveis de ambiente necessárias — ver .env.example
 """
 
+import base64
 import io
 import os
 import re
-import time
 import unicodedata
 import datetime
 from pathlib import Path
 
-import requests
 from fastapi import FastAPI, Header, HTTPException
 from docxtpl import DocxTemplate
 from openpyxl import Workbook, load_workbook
-import msal
 
 # ============================================================
 # Config (variáveis de ambiente — ver .env.example)
 # ============================================================
-TENANT_ID = os.environ.get("TENANT_ID", "")
-CLIENT_ID = os.environ.get("CLIENT_ID", "")
-CLIENT_SECRET = os.environ.get("CLIENT_SECRET", "")
-SITE_ID = os.environ.get("SITE_ID", "")  # id do site do SharePoint (não a URL)
-
-# Caminhos DENTRO da biblioteca de documentos do site (Graph usa path relativo à raiz do drive)
-SHAREPOINT_DOCS_FOLDER = os.environ.get("SHAREPOINT_DOCS_FOLDER", "Apoio/Documentos/Parecer/Saida")
-SHAREPOINT_EXCEL_PATH = os.environ.get("SHAREPOINT_EXCEL_PATH", "Apoio/Documentos/Parecer/Base/base_talentos.xlsx")
-
-# Chave simples que o Copilot Studio envia no header pra autenticar a chamada
+# Chave simples que o flow do Power Automate envia no header pra autenticar a chamada
 API_KEY = os.environ.get("PARECER_API_KEY", "")
 
-# MODO DEMO: liga automaticamente se as credenciais do Graph não estiverem
-# configuradas (ex.: enquanto o admin não concede o Sites.Selected). Nesse
-# modo o serviço gera o Word e atualiza o Excel LOCALMENTE, em vez de subir
-# pro SharePoint — serve pra validar a conexão com o Copilot Studio e a
-# geração do documento sem depender do acesso ao SharePoint ainda.
-DEMO_MODE = os.environ.get("PARECER_DEMO_MODE", "").lower() == "true" or not all(
-    [TENANT_ID, CLIENT_ID, CLIENT_SECRET, SITE_ID]
-)
-LOCAL_OUTPUT_DIR = Path(__file__).parent / "output_demo"
+# Nome do arquivo da Base de Talentos devolvido no JSON de resposta (só
+# informativo pro flow usar ao gravar — o caminho real dentro do
+# SharePoint é definido no próprio flow, não aqui).
+EXCEL_FILENAME = os.environ.get("PARECER_EXCEL_FILENAME", "base_talentos.xlsx")
+
+# Pasta local só pra depuração manual (ex.: testar com curl sem o flow) —
+# não tem nenhum papel em produção, é só um rastro pra facilitar debug.
+LOCAL_OUTPUT_DIR = Path(__file__).parent / "output_local"
 
 TEMPLATE_PATH = Path(__file__).parent / "ModeloParecer_jinja.docx"
-
-GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
 BASE_TALENTOS_FIELDS = [
     "Nome_Completo", "Telefone", "Cidade", "UF", "LinkedIn_URL",
@@ -96,8 +90,8 @@ FIELD_ORDER += [
     "Parecer_Final",
 ]
 
-# Rótulos estáticos das competências — o agente não precisa mais enviar
-# isso, o servidor já preenche sozinho (evita 5 campos redundantes).
+# Rótulos estáticos das competências — o agente não precisa enviar isso,
+# o servidor já preenche sozinho (evita 5 campos redundantes no JSON).
 STATIC_LABELS = {
     "Comunicacao": "Comunicação",
     "Organizacao": "Organização",
@@ -141,42 +135,6 @@ def normalize_payload(raw: dict) -> dict:
     agente tenha mandado alguma vazia/faltando. Valores None viram ''."""
     all_keys = FIELD_ORDER + [k for k in BASE_TALENTOS_FIELDS if k not in FIELD_ORDER]
     return {k: ("" if raw.get(k) is None else str(raw.get(k))) for k in all_keys}
-
-
-# ============================================================
-# Microsoft Graph — autenticação e I/O no SharePoint
-# ============================================================
-def get_graph_token() -> str:
-    app = msal.ConfidentialClientApplication(
-        CLIENT_ID,
-        authority=f"https://login.microsoftonline.com/{TENANT_ID}",
-        client_credential=CLIENT_SECRET,
-    )
-    result = app.acquire_token_for_client(scopes=["https://graph.microsoft.com/.default"])
-    if "access_token" not in result:
-        raise RuntimeError(f"Falha ao autenticar no Graph: {result.get('error_description')}")
-    return result["access_token"]
-
-
-def graph_upload_file(token: str, relative_path: str, content: bytes) -> dict:
-    url = f"{GRAPH_BASE}/sites/{SITE_ID}/drive/root:/{relative_path}:/content"
-    resp = requests.put(
-        url,
-        headers={"Authorization": f"Bearer {token}"},
-        data=content,
-        timeout=60,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def graph_download_file(token: str, relative_path: str) -> bytes | None:
-    url = f"{GRAPH_BASE}/sites/{SITE_ID}/drive/root:/{relative_path}:/content"
-    resp = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=60)
-    if resp.status_code == 404:
-        return None
-    resp.raise_for_status()
-    return resp.content
 
 
 # ============================================================
@@ -273,14 +231,15 @@ def render_docx(payload: dict) -> bytes:
 # ============================================================
 # API
 # ============================================================
-app = FastAPI(title="Gerar Parecer", version="1.0")
+app = FastAPI(title="Gerar Parecer", version="2.0")
 
 
 @app.post("/gerar-parecer")
 def gerar_parecer(body: dict, x_api_key: str = Header(default="")):
-    """Recebe o JSON de 138 campos direto (o mesmo que o Parse JSON do
-    flow monta a partir de dados_parecer_json). Chamado pela ação HTTP
-    do flow — não é mais chamado direto pelo Copilot Studio."""
+    """Recebe o JSON de 138 campos do parecer + (opcional)
+    excel_atual_base64 com o conteúdo atual da Base de Talentos. Devolve
+    o Word gerado e o Excel atualizado, ambos em base64, prontos pro
+    flow gravar no SharePoint com as ações nativas."""
     if API_KEY and x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="API key inválida.")
 
@@ -298,68 +257,52 @@ def gerar_parecer(body: dict, x_api_key: str = Header(default="")):
     dt_str = data_envio.strftime("%Y-%m-%d")
     filename = f"Parecer - {cliente} - {cargo} - {cand} - {dt_str}.docx"
 
-    # 1) Gera o docx (sempre local, independe do SharePoint)
+    # 1) Gera o docx
     try:
         docx_bytes = render_docx(payload)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Falha ao gerar o documento Word: {e}")
 
+    # 2) Upsert no Excel (recebido em base64, se houver)
     tem_dados_base = any(
         (payload.get(k) or "").strip() for k in ("Nome_Completo", "LinkedIn_URL", "Telefone")
     )
 
-    if DEMO_MODE:
-        # ---- Caminho DEMO: salva local em vez de ir pro SharePoint ----
-        LOCAL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-        doc_path = LOCAL_OUTPUT_DIR / filename
-        doc_path.write_bytes(docx_bytes)
-
-        base_status = "sem_dados_minimos"
-        if tem_dados_base:
-            excel_path = LOCAL_OUTPUT_DIR / "base_talentos.xlsx"
-            existing = excel_path.read_bytes() if excel_path.exists() else None
-            new_bytes, base_status = upsert_talentos(existing, payload)
-            excel_path.write_bytes(new_bytes)
-
-        return {
-            "status": "sucesso",
-            "modo": "DEMO — arquivo salvo localmente no servidor, SharePoint ainda não configurado",
-            "documento_url": f"(demo) {doc_path}",
-            "documento_nome": filename,
-            "base_talentos_status": base_status,
-        }
-
-    # ---- Caminho real: sobe pro SharePoint via Microsoft Graph ----
-    try:
-        token = get_graph_token()
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Falha ao autenticar no Microsoft Graph: {e}")
-
-    try:
-        doc_result = graph_upload_file(token, f"{SHAREPOINT_DOCS_FOLDER}/{filename}", docx_bytes)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Falha ao subir o documento no SharePoint: {e}")
-
-    base_status = "erro"
+    excel_base64_out = ""
+    base_status = "sem_dados_minimos"
     if tem_dados_base:
+        excel_atual_b64 = (body.get("excel_atual_base64") or "").strip()
+        existing_bytes = None
+        if excel_atual_b64:
+            try:
+                existing_bytes = base64.b64decode(excel_atual_b64)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"excel_atual_base64 inválido: {e}")
         try:
-            existing = graph_download_file(token, SHAREPOINT_EXCEL_PATH)
-            new_bytes, base_status = upsert_talentos(existing, payload)
-            graph_upload_file(token, SHAREPOINT_EXCEL_PATH, new_bytes)
+            new_excel_bytes, base_status = upsert_talentos(existing_bytes, payload)
+            excel_base64_out = base64.b64encode(new_excel_bytes).decode("ascii")
         except Exception as e:
-            base_status = f"erro: {e}"
-    else:
-        base_status = "sem_dados_minimos"
+            raise HTTPException(status_code=500, detail=f"Falha ao atualizar a Base de Talentos: {e}")
+
+    # 3) Cópia local só pra depuração manual (não afeta a resposta ao flow)
+    try:
+        LOCAL_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        (LOCAL_OUTPUT_DIR / filename).write_bytes(docx_bytes)
+        if excel_base64_out:
+            (LOCAL_OUTPUT_DIR / EXCEL_FILENAME).write_bytes(base64.b64decode(excel_base64_out))
+    except Exception:
+        pass
 
     return {
         "status": "sucesso",
-        "modo": "SharePoint",
-        "documento_url": doc_result.get("webUrl"),
         "documento_nome": filename,
+        "documento_base64": base64.b64encode(docx_bytes).decode("ascii"),
+        "excel_nome": EXCEL_FILENAME,
+        "excel_base64": excel_base64_out,
         "base_talentos_status": base_status,
     }
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "modo": "DEMO (sem SharePoint)" if DEMO_MODE else "SharePoint"}
+    return {"status": "ok", "modo": "arquivos via base64 (sem Graph/SharePoint direto)"}
