@@ -43,6 +43,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Header, HTTPException
 from docxtpl import DocxTemplate
+from docx import Document
 from openpyxl import Workbook, load_workbook
 
 # ============================================================
@@ -118,6 +119,26 @@ def sanitize_filename(s: str) -> str:
     return re.sub(r'[\\/:*?"<>|]+', "_", (s or "").strip())
 
 
+# Caracteres de controle que o padrão XML 1.0 NÃO aceita dentro de texto
+# (o Word usa XML por baixo dos panos). Se um valor vindo do agente —
+# currículo colado, transcrição de entrevista, etc. — tiver algum desses
+# caracteres "invisíveis" (comuns em textos copiados de PDF/Teams/Word),
+# o .docx final continua sendo um .zip válido (por isso o "unzip -t"
+# não acusava nada), mas o XML interno fica inválido e o Word recusa
+# abrir com "Ocorreu um erro no Word ao tentar abrir o ficheiro".
+# Faixa válida no XML 1.0: #x9 | #xA | #xD | [#x20-#xD7FF] |
+# [#xE000-#xFFFD] | [#x10000-#x10FFFF]. Removemos tudo fora disso.
+_XML_INVALID_CHARS_RE = re.compile(
+    "[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD\U00010000-\U0010FFFF]"
+)
+
+
+def strip_xml_invalid_chars(s: str) -> str:
+    if not s:
+        return s
+    return _XML_INVALID_CHARS_RE.sub("", s)
+
+
 def parse_date_flexible(s: str):
     if not s:
         return None
@@ -132,18 +153,55 @@ def parse_date_flexible(s: str):
 
 def normalize_payload(raw: dict) -> dict:
     """Garante que todas as 138 chaves esperadas existem, mesmo que o
-    agente tenha mandado alguma vazia/faltando. Valores None viram ''."""
+    agente tenha mandado alguma vazia/faltando. Valores None viram ''.
+    Também remove caracteres de controle inválidos em XML (ver
+    strip_xml_invalid_chars) — é isso que evita o Word corromper o
+    arquivo quando algum campo (currículo/transcrição colados) traz
+    caracteres invisíveis que o XML do .docx não aceita."""
     all_keys = FIELD_ORDER + [k for k in BASE_TALENTOS_FIELDS if k not in FIELD_ORDER]
-    return {k: ("" if raw.get(k) is None else str(raw.get(k))) for k in all_keys}
+    return {
+        k: strip_xml_invalid_chars("" if raw.get(k) is None else str(raw.get(k)))
+        for k in all_keys
+    }
 
 
 # ============================================================
 # Excel — mesma lógica de upsert do registrar_talentos.py original
 # ============================================================
+# Larguras de coluna (em "caracteres", unidade padrão do openpyxl/Excel).
+# Aplicadas sempre que a planilha passa por aqui, então mesmo uma
+# base_talentos.xlsx antiga (já criada com colunas estreitas) volta a
+# ficar com larguras razoáveis a cada parecer novo.
+_COLUMN_WIDTHS = {
+    "Nome_Completo": 28,
+    "Telefone": 16,
+    "Cidade": 18,
+    "UF": 6,
+    "LinkedIn_URL": 32,
+    "Cliente": 18,
+    "Cargo_Aplicado": 26,
+    "Senioridade_Aplicada": 18,
+    "Data_Entrevista": 14,
+    "Anos_Exp_No_Cargo": 12,
+    "Anos_Exp_Geral": 12,
+    "Recomendacao": 16,
+    "Escolaridade": 20,
+    "Area_Formacao": 22,
+    "Recrutador_Responsavel": 20,
+    "Palavras_Chave_5": 30,
+    "Observacoes": 60,
+}
+
+
 def ensure_excel_headers(ws):
     if ws.max_row == 1 and all(ws.cell(1, c + 1).value is None for c in range(len(BASE_TALENTOS_FIELDS))):
         for i, h in enumerate(BASE_TALENTOS_FIELDS, start=1):
             ws.cell(1, i, h)
+
+    for i, h in enumerate(BASE_TALENTOS_FIELDS, start=1):
+        width = _COLUMN_WIDTHS.get(h)
+        if width:
+            ws.column_dimensions[ws.cell(1, i).column_letter].width = width
 
 
 def _columns_map():
@@ -225,7 +283,25 @@ def render_docx(payload: dict) -> bytes:
     tpl.render(ctx)
     buf = io.BytesIO()
     tpl.save(buf)
-    return buf.getvalue()
+    data = buf.getvalue()
+
+    # Autoverificação: tenta reabrir o .docx recém-gerado antes de devolvê-lo.
+    # Um .zip pode estar tecnicamente íntegro (unzip -t não acusa nada) e
+    # mesmo assim ter XML interno inválido, que o Word recusa abrir. Se
+    # isso acontecer aqui, preferimos falhar com um erro 500 claro do que
+    # devolver pro flow um arquivo que só vai quebrar na hora de abrir no
+    # Word.
+    try:
+        doc = Document(io.BytesIO(data))
+        _ = len(doc.paragraphs)  # força o parse completo do document.xml
+    except Exception as e:
+        raise RuntimeError(
+            f"O .docx gerado não passou na verificação de integridade "
+            f"(provavelmente algum campo do payload contém caracteres "
+            f"inválidos para XML): {e}"
+        )
+
+    return data
 
 
 # ============================================================
