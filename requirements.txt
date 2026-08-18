@@ -4,5 +4,3 @@ gunicorn==23.0.0
 pydantic==2.9.2
 docxtpl==0.18.0
 openpyxl==3.1.5
-msal==1.31.0
-requests==2.32.3
