@@ -6,6 +6,7 @@ versão antiga fazia isso e exigia um App Registration no Entra ID com
 consentimento de administrador). Agora ele só recebe dados e devolve
 arquivos prontos — quem grava no SharePoint é o próprio Power Automate,
 usando os conectores nativos de SharePoint (login normal, sem admin).
+
 Fluxo, na ordem:
   1. O flow do Power Automate baixa o Base de Talentos atual do
      SharePoint (ação nativa "Obter conteúdo do arquivo") e converte pra
@@ -25,10 +26,13 @@ Fluxo, na ordem:
      ("appended" / "updated" / "skipped" / "sem_dados_minimos").
   5. O flow grava os dois arquivos no SharePoint com as ações nativas
      "Criar arquivo" / "Atualizar arquivo" e responde ao agente.
+
 Rodar localmente pra testar:
     uvicorn main:app --host 0.0.0.0 --port 8000
+
 Variáveis de ambiente necessárias — ver .env.example
 """
+
 import base64
 import io
 import os
@@ -56,6 +60,7 @@ EXCEL_FILENAME = os.environ.get("PARECER_EXCEL_FILENAME", "base_talentos.xlsx")
 # Pasta local só pra depuração manual (ex.: testar com curl sem o flow) —
 # não tem nenhum papel em produção, é só um rastro pra facilitar debug.
 LOCAL_OUTPUT_DIR = Path(__file__).parent / "output_local"
+
 TEMPLATE_PATH = Path(__file__).parent / "ModeloParecer_jinja.docx"
 
 BASE_TALENTOS_FIELDS = [
@@ -97,6 +102,7 @@ STATIC_LABELS = {
 }
 
 ALL_TEMPLATE_FIELDS = FIELD_ORDER  # os 128 campos que o docxtpl espera
+
 
 # ============================================================
 # Normalização do payload — o agente já manda JSON estruturado (via
@@ -191,6 +197,7 @@ def ensure_excel_headers(ws):
     if ws.max_row == 1 and all(ws.cell(1, c + 1).value is None for c in range(len(BASE_TALENTOS_FIELDS))):
         for i, h in enumerate(BASE_TALENTOS_FIELDS, start=1):
             ws.cell(1, i, h)
+
     for i, h in enumerate(BASE_TALENTOS_FIELDS, start=1):
         width = _COLUMN_WIDTHS.get(h)
         if width:
@@ -243,9 +250,11 @@ def upsert_talentos(existing_bytes: bytes | None, row: dict) -> tuple[bytes, str
     else:
         wb = Workbook()
         ws = wb.active
+
     ensure_excel_headers(ws)
     cols = _columns_map()
     r_match = _find_matching_row(ws, row)
+
     if r_match is None:
         ws.append([row.get(k, "") for k in BASE_TALENTOS_FIELDS])
         status = "appended"
@@ -258,6 +267,7 @@ def upsert_talentos(existing_bytes: bytes | None, row: dict) -> tuple[bytes, str
             status = "updated"
         else:
             status = "skipped"
+
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue(), status
@@ -275,6 +285,7 @@ def upsert_talentos(existing_bytes: bytes | None, row: dict) -> tuple[bytes, str
 # esses índices precisam ser revisados.
 REQUIREMENT_TABLE_INDEXES = [2, 3, 4]
 HEADER_ROWS_PER_TABLE = 2
+
 
 _W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
@@ -302,19 +313,6 @@ def remove_empty_requirement_rows(doc):
                 tr.getparent().remove(tr)
 
 
-def remove_empty_requirement_blocks(doc):
-    """Remove a tabela inteira (título + cabeçalho de colunas, ambos em
-    azul) quando nenhuma linha de dado sobrou nela — ex.: vaga sem nenhum
-    requisito desejável ou sem nenhuma certificação obrigatória. Precisa
-    rodar DEPOIS de remove_empty_requirement_rows, senão nunca vai achar
-    tabela "vazia" (as linhas em branco ainda estariam lá)."""
-    target_tables = [doc.tables[i] for i in REQUIREMENT_TABLE_INDEXES if i < len(doc.tables)]
-    for table in target_tables:
-        remaining_trs = table._tbl.findall(_W + "tr")
-        if len(remaining_trs) <= HEADER_ROWS_PER_TABLE:
-            table._tbl.getparent().remove(table._tbl)
-
-
 def render_docx(payload: dict) -> bytes:
     ctx = {f: payload.get(f, "") for f in ALL_TEMPLATE_FIELDS}
     ctx.update(STATIC_LABELS)  # garante os rótulos das competências
@@ -340,12 +338,10 @@ def render_docx(payload: dict) -> bytes:
             f"inválidos para XML): {e}"
         )
 
-    # Remove linhas vazias (slots de requisito/certificação não usados) e,
-    # se a tabela inteira ficou sem nenhuma linha de dado, remove o bloco
-    # inteiro (título + cabeçalho). Depois resalva e reverifica de novo
-    # pra garantir que a limpeza não quebrou nada.
+    # Remove linhas vazias (slots de requisito/certificação não usados) e
+    # resalva. Reverifica de novo depois pra garantir que a limpeza não
+    # quebrou nada.
     remove_empty_requirement_rows(doc)
-    remove_empty_requirement_blocks(doc)
     buf2 = io.BytesIO()
     doc.save(buf2)
     data = buf2.getvalue()
@@ -403,6 +399,7 @@ def gerar_parecer(body: dict, x_api_key: str = Header(default="")):
     tem_dados_base = any(
         (payload.get(k) or "").strip() for k in ("Nome_Completo", "LinkedIn_URL", "Telefone")
     )
+
     excel_base64_out = ""
     base_status = "sem_dados_minimos"
     if tem_dados_base:
